@@ -1,109 +1,108 @@
-import json  # Ensure the import is used
-from json import load, dump
-from dotenv import dotenv_values
-import requests
 import datetime
-from groq import Groq
+from dotenv import dotenv_values
+from Backend.LLM import stream_chat, get_provider, get_model
+from Backend.Language import detect_language, set_reply_language, build_system_prompt
+from Backend.RealtimeSearchEngine import RealtimeSearchEngine
+from Backend.WebFallback import should_search_web, web_search_notice
+from Backend.WebSearchProvider import is_web_worthy
+from Backend.AutoExecute import auto_execute_from_voice, wants_pc_action, sanitize_refusal
+from Backend import MongoDB as db
+from Backend.config import LLM_MAX_TOKENS, LLM_CONTEXT
 
 env_vars = dotenv_values(".env")
-
 Username = env_vars.get("Username")
 Assistantname = env_vars.get("Assistantname")
-GroqAPIKey = env_vars.get("GroqAPIKey")
 
-client = Groq(api_key=GroqAPIKey)
 
-messages = []
+def _needs_time_context(query: str) -> bool:
+    q = query.lower()
+    keys = ("time", "date", "day", "today", "clock", "hour", "samay", "waqt", "tarikh", "baje")
+    return any(w in q for w in keys)
 
-System = f"""Hello, I am {Username}, You are a very accurate and advanced AI chatbot named {Assistantname} which also has real-time up-to-date information from the internet.
-*** Do not tell time until I ask, do not talk too much, just answer the question.***
-*** Reply in only English, even if the question is in Hindi, reply in English.***
-*** Do not provide notes in the output, just answer the question and never mention your training data. ***
-"""
-
-SystemChatBot = [
-    {"role": "system", "content": System}
-]
-
-try:
-    with open(r"Data\ChatLog.json", "r") as f:
-        messages = load(f)
-except FileNotFoundError:
-    with open(r"Data\ChatLog.json", "w") as f:
-        dump([], f)
-except json.JSONDecodeError:
-    print("ChatLog.json is empty or corrupted. Initializing with an empty list.")
-    with open(r"Data\ChatLog.json", "w") as f:
-        dump([], f)
 
 def RealtimeInformation():
-    current_date_time = datetime.datetime.now()
-    day = current_date_time.strftime("%A")
-    date = current_date_time.strftime("%d")
-    month = current_date_time.strftime("%B")
-    year = current_date_time.strftime("%Y")
-    hour = current_date_time.strftime("%H")
-    minute = current_date_time.strftime("%M")
-    second = current_date_time.strftime("%S")
+    now = datetime.datetime.now()
+    return f"Now: {now.strftime('%A %d %B %Y, %H:%M:%S')}."
 
-    data = f"Please use this real-time information if needed:\n"
-    data += f"Day: {day}\nDate: {date}\nMonth: {month}\nYear: {year}\n"
-    data += f"Time: {hour} hours, {minute} minutes, {second} seconds.\n"
-    return data
 
 def AnswerModifier(Answer):
-    lines = Answer.split('\n')
-    non_empty_lines = [line for line in lines if line.strip()]
-    modified_answer = '\n'.join(non_empty_lines)
-    return modified_answer
+    return "\n".join([line for line in Answer.split("\n") if line.strip()])
 
-def ChatBot(Query):
-    """ This function sends the user's query to the chatbot and returns the AI's response """
 
+def ChatBot(
+    Query,
+    on_chunk=None,
+    language=None,
+    action_done: str = None,
+    live_context: str = None,
+):
     try:
-        with open(r"Data\ChatLog.json", "r") as f:
-            messages = load(f)
+        lang = language or detect_language(Query)
+        set_reply_language(lang)
 
-        messages.append({"role": "user", "content": f"{Query}"})
+        if is_web_worthy(Query) and not wants_pc_action(Query) and not action_done:
+            return RealtimeSearchEngine(Query, on_chunk=on_chunk, language=lang)
 
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=SystemChatBot + [{"role": "system", "content": RealtimeInformation()}] + messages,
-            max_tokens=1024,
-            temperature=0.7,
-            top_p=1,
-            stream=True,
-            stop=None
+        messages = db.get_recent_messages(LLM_CONTEXT)
+        messages.append({"role": "user", "content": Query})
+
+        system = build_system_prompt(Assistantname, Username, lang)
+        extra = "If you lack facts not in chat history, say briefly you will check the web."
+        if action_done:
+            extra = (
+                f"SYSTEM ALREADY EXECUTED ON PC:\n{action_done}\n"
+                "Confirm in the user's display language that YOU did it. "
+                "Never say run it yourself or I cannot."
+            )
+        elif wants_pc_action(Query):
+            extra += " User wants a PC action — assume Nexus executes it; never tell them to run manually."
+
+        api_messages = [{"role": "system", "content": system + " " + extra}]
+        if live_context:
+            api_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "LIVE PC CONTEXT (screen/windows/IP — use this, do not guess):\n"
+                        + live_context[:3500]
+                    ),
+                }
+            )
+        if _needs_time_context(Query):
+            api_messages.append({"role": "system", "content": RealtimeInformation()})
+        api_messages.extend(messages)
+
+        try:
+            from Backend.config import HUMAN_MODE
+            temp = 0.72 if HUMAN_MODE else 0.4
+        except Exception:
+            temp = 0.4
+
+        answer = stream_chat(
+            api_messages,
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=temp,
+            on_chunk=on_chunk,
         )
 
-        Answer = ""
+        if not answer:
+            answer = "Please try again."
 
-        for chunk in completion:
-            if chunk.choices[0].delta.content:
-                Answer += chunk.choices[0].delta.content
+        answer = sanitize_refusal(answer, Query)
 
-        Answer = Answer.replace("</s>", "")
+        if should_search_web(Query, messages, answer) and not wants_pc_action(Query):
+            web_answer = RealtimeSearchEngine(
+                Query,
+                on_chunk=on_chunk,
+                language=lang,
+                save_messages=False,
+            )
+            answer = f"{web_search_notice(lang)}\n{web_answer}"
 
-        messages.append({"role": "assistant", "content": Answer})
+        db.save_message("user", Query, language=lang, source="chatbot")
+        db.save_message("assistant", answer, language=lang, source="chatbot")
+        return answer
 
-        with open(r"Data\ChatLog.json", "w") as f:
-            dump(messages, f, indent=4)
-
-        return Answer  # Return the answer to the main function
-
-    except requests.exceptions.RequestException as e:
-        print(f"Connection error: {e}")
-        with open(r"Data\ChatLog.json", "w") as f:
-            dump([], f, indent=4)
-        return "Connection error, please try again."
     except Exception as e:
-        print(f"Error: {e}")
-        with open(r"Data\ChatLog.json", "w") as f:
-            dump([], f, indent=4)
-        return "An error occurred, please try again."
-
-if __name__ == "__main__":
-    while True:
-        user_input = input("Enter Your Question: ")
-        response = ChatBot(user_input)
-        print(response)  # Print the response to the user
+        print(f"ChatBot error ({get_provider()}/{get_model()}): {e}")
+        return "Connection issue, please try again."

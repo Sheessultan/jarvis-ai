@@ -1,52 +1,54 @@
 
 <!DOCTYPE html>
 <html>
-<head>
-    <title>Speech Recognition</title>
-</head>
-
+<head><title>STT</title></head>
 <body>
-
 <button id="start">Start</button>
 <button id="stop">Stop</button>
-
 <h2 id="output"></h2>
-
 <script>
+let recognition, listening = false, paused = false;
 
-let recognition;
-const output = document.getElementById("output");
+function startRec() {
+    if (paused) return;
+    try {
+        recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+        recognition.lang = "en-IN";
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = function(e) {
+            if (paused) return;
+            let t = "";
+            for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript;
+            document.getElementById("output").innerHTML = t;
+        };
+        recognition.onend = function() {
+            if (listening && !paused) try { recognition.start(); } catch(err) {}
+        };
+        recognition.start();
+        listening = true;
+    } catch(err) {}
+}
 
-document.getElementById("start").onclick = function() {
+function pauseRec() {
+    paused = true;
+    listening = false;
+    if (recognition) try { recognition.stop(); } catch(err) {}
+    document.getElementById("output").innerHTML = "";
+}
 
-    recognition = new(window.SpeechRecognition || window.webkitSpeechRecognition)();
+function resumeRec() {
+    paused = false;
+    document.getElementById("output").innerHTML = "";
+    startRec();
+}
 
-    recognition.lang = "en";
-    recognition.continuous = true;
-    recognition.interimResults = true;
-
-    recognition.onresult = function(event) {
-
-        let transcript = "";
-
-        for (let i = 0; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
-        }
-
-        output.innerHTML = transcript;
-    };
-
-    recognition.start();
-};
-
+document.getElementById("start").onclick = function() { paused = false; startRec(); };
 document.getElementById("stop").onclick = function() {
-
-    if(recognition){
-        recognition.stop();
-    }
+    listening = false;
+    if (recognition) recognition.stop();
 };
-
+window.onload = function() { startRec(); };
 </script>
-
 </body>
 </html>

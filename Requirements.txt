@@ -1,5 +1,7 @@
 python-dotenv
 groq
+openai
+pymongo
 elevenlabs
 appopener
 pywhatkit
@@ -10,6 +12,7 @@ requests
 keyboard
 cohere
 googlesearch-python
+duckduckgo-search
 selenium
 mtranslate
 pygame

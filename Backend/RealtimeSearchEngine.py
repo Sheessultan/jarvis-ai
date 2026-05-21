@@ -1,9 +1,16 @@
-from googlesearch import search
-from groq import Groq
-from json import load, dump
 import datetime
 from dotenv import dotenv_values
 import os
+from Backend.LLM import stream_chat, get_provider, get_model
+from Backend.Language import (
+    detect_language,
+    set_reply_language,
+    build_system_prompt,
+    prepare_query,
+)
+from Backend.WebSearchProvider import fetch_web_results, is_web_worthy
+from Backend import MongoDB as db
+from Backend.config import FAST_MODE, SEARCH_MAX_TOKENS, LLM_CONTEXT
 
 # =========================================
 # LOAD ENV VARIABLES
@@ -13,35 +20,21 @@ env_vars = dotenv_values(".env")
 
 Username = env_vars.get("Username", "User")
 Assistantname = env_vars.get("Assistantname", "Jarvis")
-GroqAPIKey = env_vars.get("GroqAPIKey")
-
-# =========================================
-# CHECK API KEY
-# =========================================
-
-if not GroqAPIKey:
-
-    print("ERROR: GroqAPIKey not found in .env file")
-    exit()
-
-# =========================================
-# GROQ CLIENT
-# =========================================
-
-client = Groq(api_key=GroqAPIKey)
-
 # =========================================
 # SYSTEM PROMPT
 # =========================================
 
-System = f"""
-Hello, I am {Username}.
-
-You are a highly advanced AI assistant named {Assistantname}.
-
-Provide professional, accurate, and clear responses.
-Use proper grammar, punctuation, and formatting.
-"""
+def _search_system(lang: str) -> str:
+    return build_system_prompt(
+        Assistantname,
+        Username,
+        lang,
+        extra=(
+            "Use ONLY the web search snippets below for facts. "
+            "Give a clear short answer (2-6 sentences). "
+            "If snippets are weak, say you could not find fresh data online."
+        ),
+    )
 
 # =========================================
 # CREATE DATA FOLDER
@@ -53,36 +46,17 @@ os.makedirs("Data", exist_ok=True)
 # CHAT LOG FILE
 # =========================================
 
-CHATLOG_PATH = r"Data\ChatLog.json"
-
-if not os.path.exists(CHATLOG_PATH):
-
-    with open(CHATLOG_PATH, "w") as f:
-
-        dump([], f)
-
 # =========================================
 # GOOGLE SEARCH
 # =========================================
 
 def GoogleSearch(query):
-
+    """Web snippets — Wikipedia + News RSS (+ optional DDG)."""
     try:
-
-        results = list(search(query, advanced=True, num_results=5))
-
-        Answer = f"Search results for '{query}':\n\n"
-
-        for i in results:
-
-            Answer += f"Title: {i.title}\n"
-            Answer += f"Description: {i.description}\n\n"
-
-        return Answer
-
+        return fetch_web_results(query, fast=FAST_MODE)
     except Exception as e:
-
-        return f"Google Search Error: {e}"
+        print(f"Web search error: {e}")
+        return f"Web search error: {e}"
 
 # =========================================
 # CLEAN ANSWER
@@ -100,15 +74,7 @@ def AnswerModifier(answer):
 # DEFAULT CHAT
 # =========================================
 
-SystemChatBot = [
-
-    {"role": "system", "content": System},
-
-    {"role": "user", "content": "Hello"},
-
-    {"role": "assistant", "content": "Hello Sir, how can I help you?"}
-
-]
+SystemChatBot = []
 
 # =========================================
 # REALTIME INFO
@@ -134,97 +100,43 @@ Time: {current.strftime("%H:%M:%S")}
 # MAIN AI FUNCTION
 # =========================================
 
-def RealtimeSearchEngine(prompt):
+def _time_only_query(prompt: str) -> bool:
+    q = prompt.lower()
+    time_w = ("time", "date", "samay", "waqt", "tarikh", "kitne baje", "baje", "din")
+    heavy = ("weather", "mausam", "news", "khabar", "score", "match")
+    return any(w in q for w in time_w) and not any(w in q for w in heavy)
 
-    global SystemChatBot
 
+def RealtimeSearchEngine(prompt, on_chunk=None, language=None, save_messages=True):
     try:
+        lang = language or detect_language(prompt)
+        set_reply_language(lang)
 
-        with open(CHATLOG_PATH, "r") as f:
+        messages = db.get_recent_messages(LLM_CONTEXT)
+        messages.append({"role": "user", "content": prompt})
 
-            messages = load(f)
+        temp_system = [{"role": "system", "content": _search_system(lang)}, {"role": "system", "content": Information()}]
+        if not (FAST_MODE and _time_only_query(prompt)) and is_web_worthy(prompt):
+            snippets = GoogleSearch(prompt)[:3500]
+            temp_system.append({
+                "role": "system",
+                "content": f"=== WEB SEARCH DATA ===\n{snippets}\n=== END ===",
+            })
 
-    except:
-
-        messages = []
-
-    # Add user message
-    messages.append({
-
-        "role": "user",
-
-        "content": prompt
-
-    })
-
-    # Google Search Data
-    search_data = GoogleSearch(prompt)
-
-    # Temporary system context
-    temp_system = [
-
-        {"role": "system", "content": System},
-
-        {"role": "system", "content": Information()},
-
-        {"role": "system", "content": search_data}
-
-    ]
-
-    try:
-
-        completion = client.chat.completions.create(
-
-            model="llama-3.3-70b-versatile",
-
-            messages=temp_system + messages,
-
-            temperature=0.7,
-
-            max_tokens=2048,
-
-            top_p=1,
-
-            stream=True
-
+        answer = stream_chat(
+            temp_system + messages,
+            max_tokens=SEARCH_MAX_TOKENS,
+            temperature=0.4,
+            on_chunk=on_chunk,
         )
-
-        Answer = ""
-
-        print("\nAssistant:\n")
-
-        for chunk in completion:
-
-            content = chunk.choices[0].delta.content
-
-            if content:
-
-                print(content, end="", flush=True)
-
-                Answer += content
-
-        print("\n")
-
-        Answer = Answer.strip().replace("</s>", "")
-
-        # Save assistant reply
-        messages.append({
-
-            "role": "assistant",
-
-            "content": Answer
-
-        })
-
-        with open(CHATLOG_PATH, "w") as f:
-
-            dump(messages, f, indent=4)
-
-        return AnswerModifier(Answer)
+        if save_messages:
+            db.save_message("user", prompt, language=lang, source="realtime")
+            db.save_message("assistant", answer, language=lang, source="realtime")
+        return AnswerModifier(answer)
 
     except Exception as e:
-
-        return f"Groq API Error: {e}"
+        print(f"Search error ({get_provider()}/{get_model()}): {e}")
+        return f"Search error: {e}"
 
 # =========================================
 # MAIN LOOP

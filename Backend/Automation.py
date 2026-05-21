@@ -1,10 +1,17 @@
 from AppOpener import close, open as appopen
-from webbrowser import open as webopen
-from pywhatkit import search, playonyt
+from urllib.parse import quote_plus
 from dotenv import dotenv_values
 from bs4 import BeautifulSoup
 from rich import print
-from groq import Groq
+from Backend.LLM import chat as llm_chat, get_model
+from Backend import MongoDB as db
+from Backend.SystemControl import (
+    handle_powershell,
+    handle_cmd,
+    handle_browser,
+    handle_email,
+    open_url,
+)
 import webbrowser
 import subprocess
 import requests
@@ -13,18 +20,12 @@ import asyncio
 import os
 
 env_vars = dotenv_values(".env")
-GroqAPIKey = env_vars.get("GroqAPIKey")
 
 classes = ["zCubwf", "hgKELc", "LTKOO SY7ric", "ZOLcW", "gsrt vk_bk FzvWSb YwPhnf", "pclqee", "tw-Data-text tw-text-small tw-ta",
            "IZ6rdc", "05uR6d LTKOO", "vlzY6d", "webanswers-webanswers_table_webanswers-table", "dDoNo ikb4Bb gsrt", "sXLa0e", 
            "LWkfKe", "VQF4g", "qv3Wpe", "kno-rdesc", "SPZz6b"]
 
 useragent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36'
-
-# Initialize Groq client only if API key exists
-client = None
-if GroqAPIKey:
-    client = Groq(api_key=GroqAPIKey)
 
 professional_responses = [
     "Your satisfaction is my top priority; feel free to reach out if there's anything else I can help you with.",
@@ -37,7 +38,13 @@ SystemChatBot = [{"role": "system", "content": f"Hello, I am {os.environ.get('Us
 
 
 def GoogleSearch(topic):
-    search(topic)
+    """Open Google search in browser — no pywhatkit (avoids import-time internet check)."""
+    q = topic
+    for prefix in ("google search", "search", "dhundo"):
+        if q.lower().startswith(prefix):
+            q = q[len(prefix) :].strip()
+    url = f"https://www.google.com/search?q={quote_plus(q)}"
+    webbrowser.open(url)
     return True
 
 
@@ -52,34 +59,17 @@ def Content(topic):
             return False
 
     def ContentWriterAI(prompt):
-        if not client:
-            print("Error: Groq API key not found. Please check your .env file.")
-            return "Error: Unable to generate content - API key missing."
-        
         try:
             messages.append({"role": "user", "content": f"{prompt}"})
-
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=SystemChatBot + messages,
+            answer = llm_chat(
+                SystemChatBot + messages,
                 max_tokens=2048,
                 temperature=0.7,
-                top_p=1,
-                stream=True,
-                stop=None
             )
-
-            answer = ""
-
-            for chunk in completion:
-                if chunk.choices[0].delta.content:
-                    answer += chunk.choices[0].delta.content
-
-            answer = answer.replace("</s>", "")
             messages.append({"role": "assistant", "content": answer})
             return answer
         except Exception as e:
-            print(f"Error generating content: {e}")
+            print(f"Error generating content ({get_model()}): {e}")
             return f"Error: Unable to generate content - {str(e)}"
 
     topic = topic.replace("content", "").strip()
@@ -96,8 +86,11 @@ def Content(topic):
     try:
         with open(filepath, "w", encoding="utf-8") as file:
             file.write(content_by_ai)
-        print(f"Content written to: {filepath}")
-        
+        db.save_generated_content(topic, content_by_ai, filepath)
+        db.save_message("user", f"[content] {topic}", source="content")
+        db.save_message("assistant", content_by_ai[:2000], source="content")
+        print(f"Content written to: {filepath} (+ MongoDB)")
+
         OpenNotepad(filepath)
         return True
     except Exception as e:
@@ -113,7 +106,12 @@ def YouTubeSearch(topic):
 
 def PlayYoutube(query):
     try:
-        playonyt(query)
+        q = query
+        for prefix in ("play", "youtube", "bajao", "chalao"):
+            if q.lower().startswith(prefix):
+                q = q[len(prefix) :].strip()
+        url = f"https://www.youtube.com/results?search_query={quote_plus(q)}"
+        webbrowser.open(url)
         return True
     except Exception as e:
         print(f"Error playing YouTube video: {e}")
@@ -127,22 +125,122 @@ from bs4 import BeautifulSoup
 import subprocess
 import os
 import platform
+import re
+import shutil
 
-import webbrowser
-import requests
-from bs4 import BeautifulSoup
-import subprocess
-import os
-import platform
+# Windows shortcuts — open almost any app/site by voice name
+_WIN_APPS = {
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "edge": "msedge",
+    "microsoft edge": "msedge",
+    "firefox": "firefox",
+    "notepad": "notepad",
+    "calculator": "calc",
+    "calc": "calc",
+    "paint": "mspaint",
+    "cmd": "cmd",
+    "command prompt": "cmd",
+    "powershell": "powershell",
+    "explorer": "explorer",
+    "file explorer": "explorer",
+    "settings": "ms-settings:",
+    "control panel": "control",
+    "task manager": "taskmgr",
+    "spotify": "spotify",
+    "discord": "discord",
+    "whatsapp": "whatsapp",
+    "telegram": "telegram",
+    "vscode": "code",
+    "visual studio code": "code",
+    "word": "winword",
+    "excel": "excel",
+    "powerpoint": "powerpnt",
+    "outlook": "outlook",
+    "camera": "microsoft.windows.camera:",
+    "photos": "ms-photos:",
+    "store": "ms-windows-store:",
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "instagram": "https://www.instagram.com",
+    "facebook": "https://www.facebook.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "linkedin": "https://www.linkedin.com",
+    "gmail": "https://mail.google.com",
+    "maps": "https://maps.google.com",
+}
+
+
+def extract_open_target(text: str) -> str:
+    """Pull app/site name from voice command (Roman/English/Hindi mix)."""
+    try:
+        from Backend.QueryNormalize import latin_hint
+        t = latin_hint(text) or text.strip()
+    except Exception:
+        t = text.strip()
+    low = t.lower()
+    for verb in ("chalu karo", "start karo", "open karo", "kholo", "launch", "start", "open"):
+        if verb in low:
+            idx = low.rfind(verb)
+            t = t[idx + len(verb) :].strip()
+    t = re.sub(
+        r"\b(please|boss|jarvis|nexus|intelligence|mera|mujhe|ko|se|karo|kar|do|the|a|an)\b",
+        " ",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or text.strip()
+
+
+def _windows_start(target: str) -> bool:
+    """Use OS shell — widest permission without extra UAC."""
+    try:
+        if target.startswith("http://") or target.startswith("https://") or target.startswith("ms-"):
+            os.startfile(target)
+            return True
+        subprocess.run(
+            ["cmd", "/c", "start", "", target],
+            shell=False,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        return True
+    except Exception as e:
+        print(f"windows start failed: {e}")
+        return False
+
 
 def OpenApp(app, sess=requests.session()):
-    
+    app = extract_open_target(app)
+    key = app.lower().strip()
+
+    if key in _WIN_APPS:
+        if _windows_start(_WIN_APPS[key]):
+            print(f"Opened via map: {app}")
+            return True
+
+    for alias, target in _WIN_APPS.items():
+        if alias in key or key in alias:
+            if _windows_start(target):
+                print(f"Opened via alias: {app} -> {target}")
+                return True
+
+    # Direct path or executable name
+    if os.path.isfile(app) or app.endswith(".exe") or app.endswith(".lnk"):
+        if _windows_start(app):
+            return True
+
+    exe = shutil.which(key) or shutil.which(key.replace(" ", ""))
+    if exe and _windows_start(exe):
+        return True
+
     try:
-        # Try to open the app using AppOpener
         appopen(app, match_closest=True, output=True, throw_error=True)
         return True
 
-    except:
+    except Exception:
         def extract_links(html):
             if html is None:
                 return []
@@ -266,18 +364,23 @@ def System(command):
     try:
         if command == "mute":
             mute()
-        elif command == "unmute":
+            print("Executed system command: mute")
+            return True
+        if command == "unmute":
             unmute()
-        elif command == "volume up":
+            return True
+        if command == "volume up":
             volume_up()
-        elif command == "volume down":
+            return True
+        if command == "volume down":
             volume_down()
-        else:
-            print(f"Unknown system command: {command}")
-            return False
-        
-        print(f"Executed system command: {command}")
-        return True
+            return True
+
+        from Backend.WindowsControl import run_system_command
+
+        ok, msg = run_system_command(command)
+        print(msg)
+        return ok
     except Exception as e:
         print(f"Error executing system command {command}: {e}")
         return False
@@ -290,11 +393,11 @@ async def TranslateAndExecute(commands: list[str]):
         print(f"Processing command: {command}")
         
         if command.startswith("open "):
-            app_name = command.removeprefix("open ").strip()
+            app_name = extract_open_target(command.removeprefix("open ").strip())
             fun = asyncio.to_thread(OpenApp, app_name)
             funcs.append(fun)
         elif command.startswith("close "):
-            app_name = command.removeprefix("close ").strip()
+            app_name = extract_open_target(command.removeprefix("close ").strip())
             fun = asyncio.to_thread(CloseApp, app_name)
             funcs.append(fun)
         elif command.startswith("play "):
@@ -317,6 +420,26 @@ async def TranslateAndExecute(commands: list[str]):
             sys_command = command.removeprefix("system ").strip()
             fun = asyncio.to_thread(System, sys_command)
             funcs.append(fun)
+        elif command.startswith("powershell "):
+            script = command.removeprefix("powershell ").strip()
+            fun = asyncio.to_thread(handle_powershell, script)
+            funcs.append(fun)
+        elif command.startswith("cmd "):
+            script = command.removeprefix("cmd ").strip()
+            fun = asyncio.to_thread(handle_cmd, script)
+            funcs.append(fun)
+        elif command.startswith("browser "):
+            target = command.removeprefix("browser ").strip()
+            fun = asyncio.to_thread(open_url, target)
+            funcs.append(fun)
+        elif command.startswith("email "):
+            payload = command.removeprefix("email ").strip()
+            fun = asyncio.to_thread(handle_email, payload)
+            funcs.append(fun)
+        elif command.startswith("chrome "):
+            target = command.removeprefix("chrome ").strip()
+            fun = asyncio.to_thread(open_url, target, True)
+            funcs.append(fun)
         else:
             print(f"No function found for command: {command}")
 
@@ -338,7 +461,7 @@ async def Automation(commands: list[str]):
     async for result in TranslateAndExecute(commands):
         results.append(result)
     print(f"Automation completed. Results: {results}")
-    return True
+    return results
 
 
 # if __name__ == "__main__":
